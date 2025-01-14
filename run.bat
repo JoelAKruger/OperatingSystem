@@ -1,0 +1,1 @@
+qemu-system-x86_64 -cpu max -bios output/OVMF.fd -drive file=fat:rw:.\output\,format=raw,media=disk -monitor stdio -serial file:serial.txt
