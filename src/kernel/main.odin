@@ -28,7 +28,9 @@ System_Info :: struct {
 	screen: Screen_Buffer,
 	memory_map: uintptr,
 	memory_map_size: uintptr,
-	memory_map_descriptor_size: uintptr
+	memory_map_descriptor_size: uintptr,
+	rsdp: rawptr,
+	date_time: Date_Time
 }
 
 clear_screen :: proc (screen: Screen_Buffer, color: u32 = 0) {
@@ -104,6 +106,10 @@ print :: proc(args: ..any) {
 	console_print(console, ..args)
 }
 
+string_to_bytes :: proc(str: string) -> []u8 {
+	return transmute([]u8) str;
+}
+
 @export 
 kernel_entry :: proc "system" (system_info: ^System_Info) {
 	set_stack_pointer(cast(uintptr) &kernel_stack[0] + KERNEL_STACK_SIZE, kernel_main, system_info)
@@ -127,23 +133,45 @@ kernel_main :: proc "system" (system_info: ^System_Info) {
 	logger := runtime.Logger{procedure = console_log, data = &console}
 	context.logger = logger
 
-	print("Hello From Console, This is a really long string so let's hope that it wraps around")
-	print(int(size_of(Task_State_Segment)))
+	print("Hello From Console, This is a really long string so let's hope that it wraps around\n")
 
 	initialise_serial(.COM1)
 	send_string(.COM1, "Hello Serial")
-		
 
 	initialise_free_page_list(system_info)
 	load_initial_page_table(system_info)
 
-	print("About to trigger breakpoint")
-	trigger_breakpoint()
-	print("Triggered breakpoint")
+	console_handle := create_console_file()
+	fprint(&console_handle, "It is ", system_info.date_time, "\n")
 
-	print("Total free memory: ", int(total_free_memory / 1024 / 1024), " MB")
+	serial_handle := create_serial_file()
+	fprint(&serial_handle, "Serial handle\n")
 
-	
+	print("Total free memory: ", int(total_free_memory / 1024 / 1024), " MB\n")
+
+	pci_devices, error := enumerate_pci_bus()
+
+	if pci_devices != nil {
+		for device_index in 0 ..< pci_devices.device_count {
+			device := &pci_devices.devices[device_index]
+			
+			description := get_pci_device_description(device)
+			print("PCI Device: ", description, "\n")
+		}
+	}
+
+	acpi_headers, acpi_error := get_acpi_system_descriptor_table_headers(system_info)
+
+	for acpi_header_index in 0 ..< acpi_headers.header_count {
+		header := acpi_headers.headers[acpi_header_index]
+		table_type := string(header.signature[:])
+
+		print(string(header.signature[:]), "\n")
+		
+		if table_type == "APIC" {
+			get_apic(auto_cast(header))
+		}
+	}
 
 	for {
 	}
@@ -154,5 +182,8 @@ Error :: enum {
 	Success = 0,
 
 	OutOfMemory,
+	NotImplemented,
+	EndOfFile,
 	SerialError,
+	RSDPNotFound,
 }

@@ -5,6 +5,7 @@
 package kernel
 
 import "base:intrinsics"
+import "base:runtime"
 
 foreign {
 	get_cr3 :: proc() -> uintptr ---
@@ -35,14 +36,22 @@ Page_Map_Entry :: bit_field u64 {
 	address_high: uintptr | 52,
 }
 
+#assert(size_of(Page_Map) == PAGE_SIZE)
 Page_Map :: struct {
 	entries: [512]Page_Map_Entry
 }
 
-#assert(size_of(Page_Map) == PAGE_SIZE)
-
 PAGE_SIZE :: 0x1000
 PAGE_MASK :: 0xFFFFFFFFFFFFF000
+
+Page_Options_Enum :: enum {
+	ReadWrite,
+	User,
+	WriteThrough,
+	CacheDisabled,
+}
+
+Page_Options :: bit_set [Page_Options_Enum]
 
 free_page_list_head : uintptr = 0
 total_free_memory : uintptr = 0
@@ -111,7 +120,7 @@ allocate_page :: proc () -> (Virtual_Address, Error) {
 }
 
 
-map_page :: proc (pml4: ^Page_Map, virtual_addr: Virtual_Address, physical_addr: Physical_Address) -> Error {
+map_page :: proc (pml4: ^Page_Map, virtual_addr: Virtual_Address, physical_addr: Physical_Address, options: Page_Options) -> Error {
 	pml4_entry := &pml4.entries[(virtual_addr >> 39) & 0x1FF]
 
 	pml3: ^Page_Map
@@ -158,7 +167,10 @@ map_page :: proc (pml4: ^Page_Map, virtual_addr: Virtual_Address, physical_addr:
 	} else {
 		pml1_entry.address_high = physical_addr >> 12
 		pml1_entry.present = true
-		pml1_entry.read_write = true
+		pml1_entry.read_write = (.ReadWrite in options)
+		pml1_entry.user = (.User in options)
+		pml1_entry.cache_disabled = (.CacheDisabled in options)
+		pml1_entry.write_through = (.WriteThrough in options)
 	}
 
 	return .None
@@ -185,16 +197,23 @@ create_page_table :: proc (system_info: ^System_Info) -> (pml4: ^Page_Map, error
 		start := round_page_down(uintptr(region.physical_start))
 		end   := round_page_up(uintptr(region.physical_start + PAGE_SIZE * region.number_of_pages))
 
+		page_options: Page_Options = {.ReadWrite}
+
+		if region.type == .Conventional {
+			page_options = {.ReadWrite}
+		}
+
 		for page := start; page < end; page += PAGE_SIZE {
-			map_page(pml4, page, page) or_return
+			map_page(pml4, page, page, page_options) or_return
 		}
 	}
 
 	fb_start := round_page_down(cast(uintptr) system_info.screen.pixels)
-	fb_end := round_page_up(cast(uintptr) system_info.screen.pixels + uintptr(system_info.screen.height) * uintptr(system_info.screen.pixels_per_scanline))
+	fb_end := round_page_up(cast(uintptr) system_info.screen.pixels + 4 * uintptr(system_info.screen.height) * uintptr(system_info.screen.pixels_per_scanline))
 	
+	page_options: Page_Options = {.ReadWrite}
 	for page := fb_start; page < fb_end; page += PAGE_SIZE {
-		map_page(pml4, page, page) or_return
+		map_page(pml4, page, page, page_options) or_return
 	}
 
 	return pml4, .Success
@@ -213,3 +232,53 @@ load_initial_page_table :: proc (system_info: ^System_Info) {
 KERNEL_STACK_SIZE :: 65536
 kernel_stack : [KERNEL_STACK_SIZE]u8
 
+Memory_Arena :: struct {
+	base: uintptr,
+	used: uintptr,
+	capacity: uintptr
+}
+
+memory_arena_alloc :: proc (arena: ^Memory_Arena, size: int, alignment: int) -> ([]byte, runtime.Allocator_Error) {
+	extra := uintptr(alignment) - (arena.base + arena.used) % uintptr(alignment)
+	bytes := extra + uintptr(size)
+
+	if arena.used + bytes <= arena.capacity {
+		result := cast([^]byte)(arena.base + arena.used + extra)
+		arena.used += bytes
+		return result[0:size], .None
+	}
+
+	return nil, .Out_Of_Memory
+}
+
+memory_arena_allocator :: proc (allocator_data: rawptr, mode: runtime.Allocator_Mode, size, alignment: int, old_memory: rawptr, 
+	old_size: int, location: runtime.Source_Code_Location) -> (result: []byte, error: runtime.Allocator_Error) {
+	arena := cast(^Memory_Arena) allocator_data
+
+	switch mode {
+		case .Alloc, .Resize: {
+			result := memory_arena_alloc(arena, size, alignment) or_return
+			intrinsics.mem_zero(&result, len(result))
+			return result, .None
+		}
+		case .Alloc_Non_Zeroed, .Resize_Non_Zeroed: {
+			result := memory_arena_alloc(arena, size, alignment) or_return
+			return result, .None
+		}
+		case .Free_All: {
+			arena.used = 0
+		}
+		case .Free: {
+		}
+		case .Query_Features, .Query_Info: {
+			return nil, .Mode_Not_Implemented
+		}
+	}
+
+	return nil, .None
+}
+
+
+create_temp_allocator :: proc (start_address: Virtual_Address) -> runtime.Allocator {
+	return {}
+}

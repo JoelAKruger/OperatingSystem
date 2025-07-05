@@ -1,10 +1,13 @@
 package kernel
 
+import "base:intrinsics"
+
 foreign {
 	load_global_descriptor_table :: proc (global_descriptor_table: ^Global_Descriptor_Table_Pointer) --- // Defined in x64.asm
     load_interrupt_descriptor_table :: proc (interrupt_descriptor_table: ^Interrupt_Descriptor_Table_Pointer) --- // Defined in x64.asm
     isr_stub_table : [32]u64 // Defined in x64.asm
     trigger_breakpoint :: proc () --- // Defined in x64.asm
+    set_segment_registers :: proc() --- // Defined in x64.asm
 }
 
 //Intel Software Development Manual Vol. 3A Figure 8-11
@@ -94,11 +97,12 @@ initialise_global_descriptor_table :: proc() {
         entry.flags = flag_values[i]
     }
 
-    //For compatibility with boot protocol where cs = 0x28 and ds, es, etc. = 0x30
+    //For compatibility with boot protocol where cs = 0x28 or 0x38 and ds, es, etc. = 0x30
     global_descriptor_table[5] = global_descriptor_table[1]
     global_descriptor_table[6] = global_descriptor_table[2]
+    global_descriptor_table[7] = global_descriptor_table[1]
 
-    (cast(^Task_State_Segment_Descriptor) &global_descriptor_table[7])^ = create_task_state_segment_descriptor(&task_state_segment, size_of(Task_State_Segment) - 1)
+    (cast(^Task_State_Segment_Descriptor) &global_descriptor_table[8])^ = create_task_state_segment_descriptor(&task_state_segment, size_of(Task_State_Segment) - 1)
 
     gdt := Global_Descriptor_Table_Pointer {limit = size_of(global_descriptor_table) - 1, base_address = uintptr(&global_descriptor_table)}
     load_global_descriptor_table(&gdt)
@@ -117,21 +121,21 @@ Interrupt_Frame :: struct {
 }
 
 Interrupt_Descriptor_Table_Attribute :: enum u8 {
-    InterruptGate = 0b10001110,
-    CallGate = 0b10001100,
-    TrapGate = 0b10001111,
+    InterruptGate     = 0b10001110,
+    CallGate          = 0b10001100,
+    TrapGate          = 0b10001111,
     UserInterruptGate = 0b11101111
 }
 
 #assert(size_of(Interrupt_Descriptor_Table_Entry) == 16)
 Interrupt_Descriptor_Table_Entry :: struct #align(16) {
-    isr0: u16, // isr = interrupt service routine
-    selector: u16,
-    ist: u8, // ist = interrupt stack table
+    isr0:      u16, // isr = interrupt service routine
+    selector:  u16,
+    ist:       u8, // ist = interrupt stack table
     attribute: Interrupt_Descriptor_Table_Attribute,
-    isr1: u16,
-    isr2: u32,
-    unused: u32
+    isr1:      u16,
+    isr2:      u32,
+    unused:    u32
 }
 
 Interrupt_Descriptor_Table_Pointer :: struct #packed {
@@ -147,7 +151,7 @@ initialise_interrupt_descriptor_table :: proc() {
         isr := isr_stub_table[i]
 
         descriptor.isr0 = u16(isr & 0xFFFF)
-        descriptor.selector = 0x08
+        descriptor.selector = 0x38
         descriptor.ist = 0
         descriptor.attribute = .InterruptGate
         descriptor.isr1 = u16((isr >> 16) & 0xFFFF)
@@ -161,6 +165,11 @@ initialise_interrupt_descriptor_table :: proc() {
 
 @export
 exception_handler :: proc "contextless" (interrupt_frame: ^Interrupt_Frame, interrupt_vector: int) -> ^Interrupt_Frame {
+    context = {}
+    send_string(.COM1, "Exception number")
+    send_int(.COM1, interrupt_vector, 10)
+    clear_screen(system_info_.screen, 0xFFFF)
+
     return interrupt_frame
 
     /*
@@ -173,4 +182,175 @@ exception_handler :: proc "contextless" (interrupt_frame: ^Interrupt_Frame, inte
 
     return interrupt_frame
     */
+}
+
+Root_System_Description_Pointer :: struct #packed {
+    signature: [8]u8,
+    checksum: u8,
+    oem_id: [6]u8,
+    revision: u8,
+    rsdt_address: u32,
+
+    length: u32,
+    xsdt_address: u64,
+    extended_checksum: u8,
+    reserved: [3]u8
+}
+
+System_Descriptor_Table_Header :: struct {
+    signature: [4]u8,
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [6]u8,
+    oem_table_id: [8]u8,
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+}
+
+get_root_system_description_table :: proc (system_info: ^System_Info) -> (header: ^System_Descriptor_Table_Header, error: Error)  {
+    if system_info.rsdp == nil {
+        return nil, .RSDPNotFound
+    }
+
+    rsdp := cast(^Root_System_Description_Pointer) system_info.rsdp
+
+    if rsdp.signature != "RSD PTR " {
+        return nil, .RSDPNotFound
+    }
+
+    print("RSDP OEM: ", string(rsdp.oem_id[:]), "\n") 
+
+    if rsdp.revision == 0 {
+        return cast(^System_Descriptor_Table_Header) uintptr(rsdp.rsdt_address), .Success
+    } else if rsdp.revision == 2 {
+        return cast(^System_Descriptor_Table_Header) uintptr(rsdp.xsdt_address), .Success
+    }
+
+    return nil, .RSDPNotFound
+}
+
+#assert(size_of(SDT_Header_Group) <= PAGE_SIZE)
+SDT_Header_Group :: struct {
+    header_count: int,
+    headers: [510]^System_Descriptor_Table_Header
+    // next: ^SDT_Header_Group
+}
+get_acpi_system_descriptor_table_headers :: proc (system_info: ^System_Info) -> (headers: ^SDT_Header_Group, error: Error) {
+    table := get_root_system_description_table(system_info) or_return
+
+    pointer_size: u32
+    if table.signature == "RSDT" {
+        pointer_size = 4
+    } else if table.signature == "XSDT" {
+        pointer_size = 8
+    }
+
+    if pointer_size == 0 {
+        return nil, .RSDPNotFound
+    }
+
+    for offset: u32 = size_of(System_Descriptor_Table_Header); offset < table.length; offset += pointer_size {
+        header := cast(^System_Descriptor_Table_Header) uintptr( (cast(^u32)(uintptr(table) + uintptr(offset)))^ )
+
+        headers.headers[headers.header_count] = header
+        headers.header_count += 1
+    }
+
+    return headers, .Success
+}
+
+Multiple_APIC_Description_Table_Header :: struct {
+    header: System_Descriptor_Table_Header,
+    local_apic_address: u32,
+    flags: u32,
+}
+
+Multiple_APIC_Description_Table_Entry_Type :: enum u8 {
+    LocalApic = 0,
+    IoApic = 1,
+    LocalApicAddressOverride = 5,
+}
+
+Multiple_APIC_Description_Table_Entry :: struct {
+    entry_type: Multiple_APIC_Description_Table_Entry_Type,
+    record_length: u8,
+}
+
+Processor_Local_APIC_Entry :: struct {
+    header: Multiple_APIC_Description_Table_Entry,
+    acpi_processor_id: u8,
+    acpi_id: u8,
+    flags: u32
+}
+
+IO_APIC_Entry :: struct {
+    header: Multiple_APIC_Description_Table_Entry,
+    id: u8,
+    reserved: u8,
+    address: u32,
+    global_system_interrupt_base: u32,
+}
+
+Local_APIC_Address_Override :: struct {
+    header: Multiple_APIC_Description_Table_Entry,
+    reserved: u16,
+    address: u64,
+}
+
+APIC :: struct {
+    local_apic: Physical_Address,
+    io_apic: Physical_Address,
+}
+
+get_apic :: proc(table: ^Multiple_APIC_Description_Table_Header) -> APIC {
+    result: APIC
+    result.local_apic = uintptr(table.local_apic_address)
+
+    start := uintptr(table) + size_of(table)
+    end   := uintptr(table) + uintptr(table.header.length)
+
+    at := start
+    for at < end {
+        entry := cast(^Multiple_APIC_Description_Table_Entry) at
+        
+        switch entry.entry_type {
+            case .LocalApic:
+                entry := cast(^Processor_Local_APIC_Entry) entry
+                if entry.flags & 0b1 != 0 {
+                    //Add LAPIC ID
+                }
+
+            case .IoApic:
+                entry := cast(^IO_APIC_Entry) entry
+                result.io_apic = uintptr(entry.address)
+
+            case .LocalApicAddressOverride:
+                entry := cast(^Local_APIC_Address_Override) entry
+                result.local_apic = uintptr(entry.address)
+        }
+
+        at += uintptr(entry.record_length)
+    }
+
+    return result
+}
+
+local_apic_write :: proc(apic: APIC, register: uintptr, value: u32) {
+    intrinsics.volatile_store(cast(^u32)(apic.local_apic + register), value)
+}
+
+local_apic_read :: proc(apic: APIC, register: uintptr) -> u32 {
+    return intrinsics.volatile_load(cast(^u32)(apic.local_apic + register))
+}
+
+io_apic_write :: proc(apic: APIC, register: uintptr, value: u32) {
+    intrinsics.volatile_store(cast(^u64)apic.io_apic, u64(register))
+    intrinsics.volatile_store(cast(^u32)(apic.io_apic + 0x10), value)
+}
+
+io_apic_read :: proc(apic: APIC, register: uintptr) -> u32 {
+    intrinsics.volatile_store(cast(^u64)apic.io_apic, u64(register))
+    return intrinsics.volatile_load(cast(^u32)(apic.io_apic + 0x10))
 }

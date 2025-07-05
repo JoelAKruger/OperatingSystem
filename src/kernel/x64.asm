@@ -12,6 +12,8 @@ global set_stack_pointer
 
 global outb
 global inb
+global outl
+global inl
 
 global load_global_descriptor_table
 global load_interrupt_descriptor_table
@@ -52,6 +54,18 @@ inb:
 	in al, dx
 	ret
 
+outl:
+	mov rdx, rdi ; dx = arg0
+	mov rax, rsi ; ax = arg1
+	out dx, eax
+	ret
+
+inl:
+	mov rdx, rdi ; dx = arg0
+	xor rax, rax ; i'm almost certain this isn't necessary
+	in eax, dx
+	ret
+
 load_global_descriptor_table:
 	lgdt [rdi]
 	ret
@@ -61,7 +75,6 @@ load_interrupt_descriptor_table:
 	ret
 
 ; The following is from https://wiki.osdev.org/Interrupts_Tutorial
-
 %macro isr_err_stub 1
 isr_stub_%+%1:
     push rbp
@@ -106,6 +119,8 @@ isr_stub_%+%1:
     pop rdi
     pop rbp	
 
+    add rsp, 8
+
     iretq
 %endmacro
 
@@ -129,11 +144,11 @@ isr_stub_%+%1:
     push rbx
     push rax
 
-	;mov rdi, rsp
-	;mov rsi, %1
-	;cld
-    ;call exception_handler
-	;mov rsp, rax
+	mov rdi, rsp
+	mov rsi, %1
+	cld
+    call exception_handler
+	; mov rsp, rax
 
     pop rax
     pop rbx
@@ -151,9 +166,7 @@ isr_stub_%+%1:
     
     pop rsi
     pop rdi
-    pop rbp	
-
-	add rsp, 8
+    pop rbp
 
     iretq
 %endmacro

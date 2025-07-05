@@ -34,6 +34,9 @@ typedef struct
     u8* MemoryMap;
     u64 MemoryMapSize;
     u64 MemoryMapDescriptorSize;
+
+    void* RSDP;
+    EFI_TIME Time;
 } system_info;
 
 //The compiler can generate code that calls these functions automatically
@@ -179,6 +182,42 @@ LoadKernel(EFI_FILE* File, EFI_SYSTEM_TABLE* SystemTable)
     return (void*)Header.e_entry;
 }
 
+int
+GuidsAreEqual(EFI_GUID* Guid1, EFI_GUID* Guid2)
+{
+    return (Guid1->Data1 == Guid2->Data1 &&
+            Guid1->Data2 == Guid2->Data2 &&
+            Guid1->Data3 == Guid2->Data3 &&
+            Guid1->Data4[0] == Guid2->Data4[0] &&
+            Guid1->Data4[1] == Guid2->Data4[1] &&
+            Guid1->Data4[2] == Guid2->Data4[2] &&
+            Guid1->Data4[3] == Guid2->Data4[3] &&
+            Guid1->Data4[4] == Guid2->Data4[4] &&
+            Guid1->Data4[5] == Guid2->Data4[5] &&
+            Guid1->Data4[6] == Guid2->Data4[6] &&
+            Guid1->Data4[7] == Guid2->Data4[7]);
+}
+
+EFI_STATUS
+GetRSDP(EFI_SYSTEM_TABLE *SystemTable, void** RSDP) {
+    EFI_CONFIGURATION_TABLE *ConfigTable;
+    EFI_GUID Acpi20TableGuid = ACPI_20_TABLE_GUID; // ACPI 2.0 GUID
+    EFI_GUID AcpiTableGuid = ACPI_TABLE_GUID;      // ACPI 1.0 GUID
+
+    *RSDP = NULL; // Initialize RSDP to NULL
+
+    ConfigTable = SystemTable->ConfigurationTable;
+    for (UINTN Index = 0; Index < SystemTable->NumberOfTableEntries; Index++) {
+        if (GuidsAreEqual(&ConfigTable[Index].VendorGuid, &Acpi20TableGuid) ||
+            GuidsAreEqual(&ConfigTable[Index].VendorGuid, &AcpiTableGuid)) {
+            *RSDP = ConfigTable[Index].VendorTable;
+            return EFI_SUCCESS;
+        }
+    }
+
+    return EFI_NOT_FOUND; // Return an error if RSDP is not found
+}
+
 // This is necessary because Clang will ignore __attribute__((sysv_abi)) as we are compiling for Windows
 void CallWithSystemVAbi(void (*func)(void*), void* arg) {
     __asm__ __volatile__ (
@@ -191,6 +230,14 @@ void CallWithSystemVAbi(void (*func)(void*), void* arg) {
                           );
 }
 
+EFI_TIME GetCurrentTime(EFI_SYSTEM_TABLE* SystemTable) 
+{
+    EFI_TIME CurrentTime;
+    SystemTable->RuntimeServices->GetTime(&CurrentTime, NULL);
+
+    return CurrentTime;
+}
+
 EFI_STATUS EFIAPI 
 EfiMain(EFI_HANDLE Image, EFI_SYSTEM_TABLE* SystemTable) 
 {
@@ -198,6 +245,8 @@ EfiMain(EFI_HANDLE Image, EFI_SYSTEM_TABLE* SystemTable)
     
     system_info System = {};
     System.Screen = GetScreenBuffer(SystemTable);
+
+    GetRSDP(SystemTable, &System.RSDP);
     
     EFI_FILE* KernelFile = LoadFile(L"Kernel.elf", Image, SystemTable);
     
@@ -219,6 +268,7 @@ EfiMain(EFI_HANDLE Image, EFI_SYSTEM_TABLE* SystemTable)
     System.MemoryMap = UEFIMemoryMap;
     System.MemoryMapSize = MemoryMapSize;
     System.MemoryMapDescriptorSize = DescriptorSize;
+    System.Time = GetCurrentTime(SystemTable);
 
     SystemTable->BootServices->ExitBootServices(Image, MapKey);
     

@@ -1,0 +1,6 @@
+.vs/
+.vscode/
+nasm/*
+odin/*
+output/*
+*.txt
